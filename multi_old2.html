@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dual Heart Rate Monitor with Editable Player Names</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f0f4f8; color: #333; text-align: center; }
+    .container { max-width: 1200px; margin: 40px auto; padding: 32px; background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    .charts-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 32px;
+    }
+    .player {
+      flex: 1 1 400px;
+      min-width: 340px;
+      max-width: 520px;
+      background: #f8fafc;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      margin: 0 8px;
+      padding: 24px 16px 32px 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .player-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .player-label {
+      font-size: 1.3rem;
+      font-weight: bold;
+      margin-right: 8px;
+    }
+    .edit-name {
+      font-size: 1rem;
+      padding: 4px 8px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      margin-right: 4px;
+    }
+    .save-btn {
+      font-size: 1rem;
+      padding: 4px 12px;
+      border-radius: 4px;
+      border: none;
+      background: #007bff;
+      color: #fff;
+      cursor: pointer;
+    }
+    button { padding: 1rem 2rem; font-size: 1.1rem; cursor: pointer; background-color: #007bff; border: none; border-radius: 6px; color: white; margin-bottom: 1rem; }
+    button:disabled { background-color: #999; cursor: not-allowed; }
+    .heartRate { font-size: 2.2rem; margin-top: 1rem; color: #d9534f; font-weight: bold; }
+    .status { margin-top: 1rem; font-style: italic; color: #555; min-height: 1.5em; }
+    .chart-container { width: 100%; max-width: 440px; height: 320px; margin-top: 18px; }
+    canvas { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+    @media (max-width: 900px) {
+      .charts-row { flex-direction: column; align-items: center; }
+      .player { max-width: 98vw; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Dual Heart Rate Monitor</h1>
+    <div class="charts-row">
+      <div class="player" id="player1">
+        <div class="player-header">
+          <span class="player-label" id="player1Label">Player 1</span>
+          <input class="edit-name" id="player1NameInput" type="text" placeholder="Enter name" />
+          <button class="save-btn" id="player1SaveBtn">Save</button>
+        </div>
+        <button id="scan1">Connect Player 1</button>
+        <div class="status" id="status1"></div>
+        <div class="heartRate" id="heartRate1">-- bpm</div>
+        <div class="chart-container">
+          <canvas id="chart1"></canvas>
+        </div>
+      </div>
+      <div class="player" id="player2">
+        <div class="player-header">
+          <span class="player-label" id="player2Label">Player 2</span>
+          <input class="edit-name" id="player2NameInput" type="text" placeholder="Enter name" />
+          <button class="save-btn" id="player2SaveBtn">Save</button>
+        </div>
+        <button id="scan2">Connect Player 2</button>
+        <div class="status" id="status2"></div>
+        <div class="heartRate" id="heartRate2">-- bpm</div>
+        <div class="chart-container">
+          <canvas id="chart2"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Date adapter for time scale -->
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@2.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script>
+    // UUIDs for Heart Rate Service and Characteristic
+    const HEART_RATE_SERVICE_UUID = 0x180D;
+    const HEART_RATE_MEASUREMENT_CHAR_UUID = 0x2A37;
+
+    // State for each player
+    let device1 = null, char1 = null;
+    let device2 = null, char2 = null;
+
+    // Chart data and config for each player
+    const WINDOW_DURATION_MS = 60 * 1000; // 60 seconds
+
+    // Player 1
+    const scan1 = document.getElementById('scan1');
+    const status1 = document.getElementById('status1');
+    const heartRate1 = document.getElementById('heartRate1');
+    const ctx1 = document.getElementById('chart1').getContext('2d');
+    const timeLabels1 = [];
+    const heartRateData1 = [];
+    const chart1 = new Chart(ctx1, {
+      type: 'line',
+      data: {
+        labels: timeLabels1,
+        datasets: [{
+          label: 'Heart Rate (bpm)',
+          data: heartRateData1,
+          borderColor: '#d9534f',
+          backgroundColor: 'rgba(217, 83, 79, 0.08)',
+          fill: true,
+          tension: 0.35,
+          pointRadius: 0,
+          borderWidth: 3,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+          x: {
+            type: 'time',
+            time: { unit: 'second', displayFormats: { second: 'HH:mm:ss' } },
+            title: { display: true, text: 'Time', font: { size: 15 } },
+            grid: { color: '#e5e7eb' },
+            min: null,
+            max: null,
+            ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10 }
+          },
+          y: {
+            min: 40,
+            max: 180,
+            title: { display: true, text: 'BPM', font: { size: 15 } },
+            grid: { color: '#e5e7eb' }
+          }
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: { enabled: true, mode: 'nearest', intersect: false }
+        },
+        elements: { point: { radius: 0 } }
+      }
+    });
+
+    // Player 2
+    const scan2 = document.getElementById('scan2');
+    const status2 = document.getElementById('status2');
+    const heartRate2 = document.getElementById('heartRate2');
+    const ctx2 = document.getElementById('chart2').getContext('2d');
+    const timeLabels2 = [];
+    const heartRateData2 = [];
+    const chart2 = new Chart(ctx2, {
+      type: 'line',
+      data: {
+        labels: timeLabels2,
+        datasets: [{
+          label: 'Heart Rate (bpm)',
+          data: heartRateData2,
+          borderColor: '#007bff',
+          backgroundColor: 'rgba(0, 123, 255, 0.08)',
+          fill: true,
+          tension: 0.35,
+          pointRadius: 0,
+          borderWidth: 3,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+          x: {
+            type: 'time',
+            time: { unit: 'second', displayFormats: { second: 'HH:mm:ss' } },
+            title: { display: true, text: 'Time', font: { size: 15 } },
+            grid: { color: '#e5e7eb' },
+            min: null,
+            max: null,
+            ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10 }
+          },
+          y: {
+            min: 40,
+            max: 180,
+            title: { display: true, text: 'BPM', font: { size: 15 } },
+            grid: { color: '#e5e7eb' }
+          }
+        },
+        plugins: {
+          legend: { display: false },
+          tooltip: { enabled: true, mode: 'nearest', intersect: false }
+        },
+        elements: { point: { radius: 0 } }
+      }
+    });
+
+    // Editable name logic for Player 1
+    const player1Label = document.getElementById('player1Label');
+    const player1NameInput = document.getElementById('player1NameInput');
+    const player1SaveBtn = document.getElementById('player1SaveBtn');
+    player1SaveBtn.addEventListener('click', () => {
+      const name = player1NameInput.value.trim();
+      player1Label.textContent = name ? name : 'Player 1';
+    });
+
+    // Editable name logic for Player 2
+    const player2Label = document.getElementById('player2Label');
+    const player2NameInput = document.getElementById('player2NameInput');
+    const player2SaveBtn = document.getElementById('player2SaveBtn');
+    player2SaveBtn.addEventListener('click', () => {
+      const name = player2NameInput.value.trim();
+      player2Label.textContent = name ? name : 'Player 2';
+    });
+
+    // Connect and subscribe for Player 1
+    scan1.addEventListener('click', async () => {
+      clearUI(1);
+      status1.textContent = 'Requesting Bluetooth Device...';
+      try {
+        device1 = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [HEART_RATE_SERVICE_UUID] }],
+          optionalServices: [HEART_RATE_SERVICE_UUID]
+        });
+        status1.textContent = `Device selected: ${device1.name || 'Unnamed'}`;
+        await connectAndSubscribe(device1, status1, heartRate1, timeLabels1, heartRateData1, chart1, 1);
+      } catch (error) {
+        status1.textContent = 'Error: ' + error.message;
+      }
+    });
+
+    // Connect and subscribe for Player 2
+    scan2.addEventListener('click', async () => {
+      clearUI(2);
+      status2.textContent = 'Requesting Bluetooth Device...';
+      try {
+        device2 = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [HEART_RATE_SERVICE_UUID] }],
+          optionalServices: [HEART_RATE_SERVICE_UUID]
+        });
+        status2.textContent = `Device selected: ${device2.name || 'Unnamed'}`;
+        await connectAndSubscribe(device2, status2, heartRate2, timeLabels2, heartRateData2, chart2, 2);
+      } catch (error) {
+        status2.textContent = 'Error: ' + error.message;
+      }
+    });
+
+    // Connect to device, subscribe to notifications, and update UI/chart
+    async function connectAndSubscribe(device, statusEl, heartRateEl, timeLabels, heartRateData, chart, playerNum) {
+      device.addEventListener('gattserverdisconnected', () => {
+        statusEl.textContent = 'Device disconnected.';
+        heartRateEl.textContent = '-- bpm';
+      });
+      try {
+        statusEl.textContent = 'Connecting to GATT Server...';
+        const server = await device.gatt.connect();
+        statusEl.textContent = 'Getting Heart Rate Service...';
+        const service = await server.getPrimaryService(HEART_RATE_SERVICE_UUID);
+        statusEl.textContent = 'Getting Heart Rate Measurement Characteristic...';
+        const characteristic = await service.getCharacteristic(HEART_RATE_MEASUREMENT_CHAR_UUID);
+        statusEl.textContent = 'Starting notifications...';
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', event => {
+          const value = event.target.value;
+          const heartRate = parseHeartRate(value);
+          heartRateEl.textContent = heartRate + ' bpm';
+          const now = new Date();
+          timeLabels.push(now);
+          heartRateData.push(heartRate);
+          // Remove old data outside the window
+          while (timeLabels.length > 0 && (now - timeLabels) > WINDOW_DURATION_MS) {
+            timeLabels.shift();
+            heartRateData.shift();
+          }
+          // Keep the x-axis fixed to the last WINDOW_DURATION_MS
+          if (timeLabels.length > 0) {
+            const lastTime = timeLabels[timeLabels.length - 1].getTime();
+            chart.options.scales.x.min = new Date(lastTime - WINDOW_DURATION_MS);
+            chart.options.scales.x.max = new Date(lastTime);
+          }
+          chart.update();
+        });
+        statusEl.textContent = 'Connected and receiving heart rate data.';
+        if (playerNum === 1) char1 = characteristic;
+        else char2 = characteristic;
+      } catch (error) {
+        statusEl.textContent = 'Connection failed: ' + error.message;
+      }
+    }
+
+    // Parse Heart Rate Measurement characteristic
+    function parseHeartRate(dataView) {
+      const flags = dataView.getUint8(0);
+      const rate16Bits = flags & 0x1;
+      let heartRate;
+      if (rate16Bits) {
+        heartRate = dataView.getUint16(1, true);
+      } else {
+        heartRate = dataView.getUint8(1);
+      }
+      return heartRate;
+    }
+
+    // Clear UI and chart for a player
+    function clearUI(playerNum) {
+      if (playerNum === 1) {
+        heartRate1.textContent = '-- bpm';
+        status1.textContent = '';
+        timeLabels1.length = 0;
+        heartRateData1.length = 0;
+        chart1.options.scales.x.min = null;
+        chart1.options.scales.x.max = null;
+        chart1.update();
+      } else {
+        heartRate2.textContent = '-- bpm';
+        status2.textContent = '';
+        timeLabels2.length = 0;
+        heartRateData2.length = 0;
+        chart2.options.scales.x.min = null;
+        chart2.options.scales.x.max = null;
+        chart2.update();
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FP Multi HRM</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f0f4f8; color: #333; text-align: center; }
+    .container { max-width: 1200px; margin: 24px auto; padding: 20px; background: #fff; border-radius: 12px; box-shadow: 0 4px 22px rgba(0,0,0,0.06); }
+    header { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:1.4rem; }
+    .controls { display:flex; gap:12px; align-items:center; }
+    select, button { padding:8px 12px; font-size:14px; border-radius:6px; border:1px solid #cfd8e3; }
+    .toggle-row { display:flex; align-items:center; gap:8px; margin-top:12px; }
+    .charts-row { display:flex; flex-wrap:wrap; gap:20px; justify-content:center; margin-top:18px; }
+    .player { width: 340px; background:#fbfdff; border-radius:10px; padding:14px; box-shadow:0 2px 8px rgba(0,0,0,0.04); display:flex; flex-direction:column; align-items:center; }
+    .player-header { display:flex; gap:8px; width:100%; align-items:center; justify-content:center; margin-bottom:8px; }
+    .player-label { font-weight:600; }
+    .edit-name { padding:6px; border-radius:6px; border:1px solid #dfe7ef; width:120px; }
+    .save-btn { background:#007bff; color:#fff; border:none; cursor:pointer; padding:6px 8px; border-radius:6px; }
+    .connect-btn { background:#14a37f; color:white; border:none; padding:8px 14px; border-radius:8px; cursor:pointer; margin-top:8px; }
+    .status { min-height:1.2em; color:#555; margin-top:6px; font-size:13px; }
+    .heartRate { font-size:1.6rem; margin-top:6px; color:#d9534f; font-weight:700; }
+    .chart-container { width:100%; height:260px; margin-top:10px; }
+    .combined-chart-container { width:100%; max-width:1000px; height:360px; margin:18px auto; display:none; }
+    canvas { background:#fff; border-radius:8px; }
+    .record-btn { background:#e83e8c; color:white; border:none; padding:8px 14px; border-radius:8px; cursor:pointer;}
+    @media (max-width:900px) {
+      .player { width: 95vw; }
+      .combined-chart-container { width:95vw; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Fanplay IoT : Multi Heart Rate Monitor</h1>
+      <div class="controls">
+        <label>Players:
+          <select id="playerCountSelect">
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+            <option value="8">8</option>
+          </select>
+        </label>
+        <button id="regenerateBtn">Generate</button>
+        <button id="recordBtn" class="record-btn">Start Recording</button>
+      </div>
+    </header>
+
+    <div class="toggle-row" style="justify-content:center;">
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="toggleCombined" />
+        <span id="toggleLabel">Show combined chart</span>
+      </label>
+    </div>
+
+    <div class="combined-chart-container" id="combinedChartContainer">
+      <canvas id="combinedChart"></canvas>
+    </div>
+
+    <div id="chartsRow" class="charts-row"></div>
+  </div>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@2.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script>
+    // --- Constants ---
+    const HEART_RATE_SERVICE_UUID = 0x180D;
+    const HEART_RATE_MEASUREMENT_CHAR_UUID = 0x2A37;
+    const WINDOW_DURATION_MS = 60 * 1000; // 60s
+    const RIGHT_PADDING_MS = 10 * 1000;
+
+    // State containers (dynamic per player)
+    let players = []; // each: {id, name, device, characteristic, timeLabels:[], data:[], chart}
+    let combinedChart = null;
+
+    // --- Recording state ---
+    let recording = false;
+    // recordingMap: timestampSecond (ISO string with ms = 0) -> { playerName: bpm, ... }
+    let recordingMap = {};
+
+    // DOM refs
+    const chartsRow = document.getElementById('chartsRow');
+    const playerCountSelect = document.getElementById('playerCountSelect');
+    const regenerateBtn = document.getElementById('regenerateBtn');
+    const toggleCombined = document.getElementById('toggleCombined');
+    const toggleLabel = document.getElementById('toggleLabel');
+    const combinedChartContainer = document.getElementById('combinedChartContainer');
+    const recordBtn = document.getElementById('recordBtn');
+
+    // --- Helpers for Chart config ---
+    function makeChartConfig(label, color, bgColor) {
+      return {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [{
+            label: label,
+            data: [],
+            borderColor: color,
+            backgroundColor: bgColor,
+            fill: true,
+            tension: 0.35,
+            pointRadius: 0,
+            borderWidth: 2,
+            spanGaps: true
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          scales: {
+            x: {
+              type: 'time',
+              time: { unit: 'second', displayFormats: { second: 'HH:mm:ss' } },
+              min: null, max: null,
+              ticks: { maxTicksLimit: 8 }
+            },
+            y: { min: 40, max: 180 }
+          },
+          plugins: { legend: { display: true } },
+          elements: { point: { radius: 0 } }
+        }
+      };
+    }
+
+    // Colors for datasets (expandable)
+    const COLORS = [
+      { c: '#d9534f', bg: 'rgba(217,83,79,0.08)' },
+      { c: '#007bff', bg: 'rgba(0,123,255,0.08)' },
+      { c: '#28a745', bg: 'rgba(40,167,69,0.08)' },
+      { c: '#ffc107', bg: 'rgba(255,193,7,0.06)' },
+      { c: '#6f42c1', bg: 'rgba(111,66,193,0.06)' },
+      { c: '#fd7e14', bg: 'rgba(253,126,20,0.06)' },
+      { c: '#20c997', bg: 'rgba(32,201,151,0.06)' },
+      { c: '#343a40', bg: 'rgba(52,58,64,0.06)' }
+    ];
+
+    // --- UI generation for N players ---
+    function generatePlayers(count) {
+      // Clear UI and arrays
+      chartsRow.innerHTML = '';
+      players = [];
+
+      for (let i = 0; i < count; i++) {
+        const id = i + 1;
+        const tile = document.createElement('div');
+        tile.className = 'player';
+        tile.id = `playerTile${id}`;
+
+        // Header: label + name input + save button
+        const header = document.createElement('div');
+        header.className = 'player-header';
+        header.innerHTML = `
+          <span class="player-label" id="playerLabel${id}">Player ${id}</span>
+          <input class="edit-name" id="playerNameInput${id}" placeholder="Name" />
+          <button class="save-btn" id="playerSaveBtn${id}">Save</button>
+        `;
+        tile.appendChild(header);
+
+        // Connect button
+        const connectBtn = document.createElement('button');
+        connectBtn.className = 'connect-btn';
+        connectBtn.id = `connectBtn${id}`;
+        connectBtn.textContent = 'Connect';
+        tile.appendChild(connectBtn);
+
+        // status
+        const status = document.createElement('div');
+        status.className = 'status';
+        status.id = `status${id}`;
+        tile.appendChild(status);
+
+        // heart rate display
+        const hr = document.createElement('div');
+        hr.className = 'heartRate';
+        hr.id = `heartRate${id}`;
+        hr.textContent = '-- bpm';
+        tile.appendChild(hr);
+
+        // chart container
+        const chartCont = document.createElement('div');
+        chartCont.className = 'chart-container';
+        chartCont.innerHTML = `<canvas id="chartCanvas${id}"></canvas>`;
+        tile.appendChild(chartCont);
+
+        chartsRow.appendChild(tile);
+
+        // initialize player object
+        players.push({
+          id,
+          name: `Player ${id}`,
+          device: null,
+          characteristic: null,
+          timeLabels: [],
+          data: [],
+          chart: null,
+          statusEl: document.getElementById(`status${id}`),
+          hrEl: document.getElementById(`heartRate${id}`),
+          nameInputEl: document.getElementById(`playerNameInput${id}`), // will exist after appended
+          labelEl: document.getElementById(`playerLabel${id}`),
+          connectBtnEl: null
+        });
+
+        // after DOM append, set connect button and save handler
+        const connectBtnEl = document.getElementById(`connectBtn${id}`);
+        players[i].connectBtnEl = connectBtnEl;
+
+        connectBtnEl.addEventListener('click', () => connectPlayer(i));
+        document.getElementById(`playerSaveBtn${id}`).addEventListener('click', () => {
+          const newName = (players[i].nameInputEl.value || `Player ${id}`).trim();
+          players[i].name = newName;
+          players[i].labelEl.textContent = newName;
+          // update chart dataset label
+          if (players[i].chart) players[i].chart.data.datasets[0].label = newName, players[i].chart.update();
+          if (combinedChart && combinedChart.data.datasets[i]) {
+            combinedChart.data.datasets[i].label = newName;
+            combinedChart.update();
+          }
+        });
+
+        // create chart instance
+        const ctx = document.getElementById(`chartCanvas${id}`).getContext('2d');
+        const color = COLORS[i % COLORS.length];
+        const cfg = makeChartConfig(players[i].name, color.c, color.bg);
+        players[i].chart = new Chart(ctx, cfg);
+      }
+
+      // Rebuild combined chart datasets to match player count
+      buildCombinedChart(count);
+    }
+
+    // Build/refresh the combined chart to have correct number of datasets
+    function buildCombinedChart(count) {
+      // create if not present
+      if (!combinedChart) {
+        const ctxC = document.getElementById('combinedChart').getContext('2d');
+        combinedChart = new Chart(ctxC, {
+          type: 'line',
+          data: { labels: [], datasets: [] },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { type: 'time', time: { unit: 'second' }, min: null, max: null },
+              y: { min: 40, max: 180 }
+            },
+            plugins: { legend: { display: true } },
+            elements: { point: { radius: 0 } },
+            animation: false
+          }
+        });
+      }
+
+      // ensure datasets match players count
+      combinedChart.data.datasets = [];
+      for (let i = 0; i < count; i++) {
+        const color = COLORS[i % COLORS.length];
+        combinedChart.data.datasets.push({
+          label: players[i] ? players[i].name : `Player ${i+1}`,
+          data: [],
+          borderColor: color.c,
+          backgroundColor: color.bg,
+          fill: false,
+          tension: 0.35,
+          pointRadius: 0,
+          borderWidth: 2,
+          spanGaps: true
+        });
+      }
+      combinedChart.data.labels = [];
+      combinedChart.update();
+    }
+
+    // Toggle combined chart view
+    toggleCombined.addEventListener('change', () => {
+      const combined = toggleCombined.checked;
+      toggleLabel.textContent = combined ? 'Show individual charts' : 'Show combined chart';
+      chartsRow.style.display = combined ? 'none' : 'flex';
+      combinedChartContainer.style.display = combined ? 'block' : 'none';
+      if (combined) updateCombinedChart();
+    });
+
+    // Connect handler for player index
+    async function connectPlayer(index) {
+      const p = players[index];
+      p.statusEl.textContent = 'Requesting device...';
+      try {
+        if (!navigator.bluetooth) throw new Error('Web Bluetooth not supported in this browser.');
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [HEART_RATE_SERVICE_UUID] }],
+          optionalServices: [HEART_RATE_SERVICE_UUID]
+        });
+        p.device = device;
+        p.statusEl.textContent = `Selected: ${device.name || 'Unnamed'}`;
+        device.addEventListener('gattserverdisconnected', () => {
+          p.statusEl.textContent = 'Device disconnected';
+          p.hrEl.textContent = '-- bpm';
+        });
+
+        p.statusEl.textContent = 'Connecting...';
+        const server = await device.gatt.connect();
+        p.statusEl.textContent = 'Getting HR service...';
+        const service = await server.getPrimaryService(HEART_RATE_SERVICE_UUID);
+        p.statusEl.textContent = 'Getting characteristic...';
+        const characteristic = await service.getCharacteristic(HEART_RATE_MEASUREMENT_CHAR_UUID);
+        p.characteristic = characteristic;
+
+        p.statusEl.textContent = 'Starting notifications...';
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', ev => {
+          const hr = parseHeartRate(ev.target.value);
+          handleNewSample(index, hr);
+        });
+
+        p.statusEl.textContent = 'Connected and receiving';
+        p.connectBtnEl.textContent = 'Connected';
+        p.connectBtnEl.disabled = true;
+      } catch (err) {
+        p.statusEl.textContent = 'Error: ' + err.message;
+      }
+    }
+
+    // Parse HR measurement (same as before)
+    function parseHeartRate(dataView) {
+      const flags = dataView.getUint8(0);
+      const rate16Bits = flags & 0x1;
+      return rate16Bits ? dataView.getUint16(1, true) : dataView.getUint8(1);
+    }
+
+    // Round a Date to nearest second and return ISO (milliseconds cleared)
+    function roundToSecond(date) {
+      const d = new Date(date);
+      d.setMilliseconds(0);
+      return d.toISOString();
+    }
+
+    // Handle a new sample for player index
+    function handleNewSample(index, heartRate) {
+      const p = players[index];
+      const now = new Date();
+      p.timeLabels.push(now);
+      p.data.push(heartRate);
+
+      // Trim window
+      while (p.timeLabels.length > 0 && (now - p.timeLabels[0]) > WINDOW_DURATION_MS) {
+        p.timeLabels.shift();
+        p.data.shift();
+      }
+
+      // Update individual chart
+      p.chart.data.labels = [...p.timeLabels];
+      p.chart.data.datasets[0].data = [...p.data];
+      if (p.timeLabels.length > 0) {
+        const last = p.timeLabels[p.timeLabels.length - 1].getTime();
+        p.chart.options.scales.x.min = new Date(last - WINDOW_DURATION_MS);
+        p.chart.options.scales.x.max = new Date(last + RIGHT_PADDING_MS);
+      } else {
+        p.chart.options.scales.x.min = null;
+        p.chart.options.scales.x.max = null;
+      }
+      p.chart.update();
+      p.hrEl.textContent = `${heartRate} bpm`;
+
+      // Recording: round timestamp to nearest second and keep latest per player per second
+      if (recording) {
+        const ts = roundToSecond(now);
+        if (!recordingMap[ts]) recordingMap[ts] = {};
+        // latest sample for player in the same second should overwrite previous
+        recordingMap[ts][p.name] = heartRate;
+      }
+
+      // If combined visible update it
+      if (toggleCombined.checked) updateCombinedChart();
+    }
+
+    // Combined chart: merge all unique timestamps from players and sample values aligned; we will use nulls where missing
+    function updateCombinedChart() {
+      // collect all timestamps
+      const allTimesSet = new Set();
+      players.forEach(p => p.timeLabels.forEach(d => allTimesSet.add(d.getTime())));
+      const allTimes = Array.from(allTimesSet).sort((a,b)=>a-b).map(t=>new Date(t));
+
+      // create per-player aligned arrays
+      players.forEach((p, idx) => {
+        const aligned = allTimes.map(t => {
+          const matchIdx = p.timeLabels.findIndex(d => d.getTime() === t.getTime());
+          return matchIdx !== -1 ? p.data[matchIdx] : null;
+        });
+        if (combinedChart.data.datasets[idx]) {
+          combinedChart.data.datasets[idx].data = aligned;
+        }
+      });
+
+      combinedChart.data.labels = allTimes;
+
+      // set x window
+      if (allTimes.length > 0) {
+        const last = allTimes[allTimes.length - 1].getTime();
+        combinedChart.options.scales.x.min = new Date(last - WINDOW_DURATION_MS);
+        combinedChart.options.scales.x.max = new Date(last + RIGHT_PADDING_MS);
+      } else {
+        combinedChart.options.scales.x.min = null;
+        combinedChart.options.scales.x.max = null;
+      }
+
+      // update dataset labels (in case names changed)
+      combinedChart.data.datasets.forEach((ds, i) => {
+        ds.label = players[i] ? players[i].name : ds.label;
+      });
+
+      combinedChart.update();
+    }
+
+    // --- Recording logic ---
+    recordBtn.addEventListener('click', () => {
+      if (!recording) {
+        // start
+        recording = true;
+        // clear previous recording map
+        recordingMap = {};
+        recordBtn.textContent = 'Stop Recording';
+        recordBtn.style.background = '#6c757d';
+      } else {
+        // stop -> generate CSV and download
+        recording = false;
+        recordBtn.textContent = 'Start Recording';
+        recordBtn.style.background = '#e83e8c';
+        // call downloadCSV which reads recordingMap
+        // if no data, show alert inside downloadCSV
+        downloadCSV();
+      }
+    });
+
+    function escapeCSV(val) {
+      if (val === null || val === undefined) return '';
+      const s = String(val);
+      if (s.includes('"') || s.includes(',') || s.includes('\n')) {
+        return `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    }
+
+    // --- UPDATED downloadCSV: wide-format (one timestamp row, columns for each player),
+    // using recordingMap with rounded-second timestamps and latest sample per player per second ---
+    function downloadCSV() {
+      // recordingMap: { tsISOsec: { "Player 1": 80, "Player 2": 92, ... }, ... }
+      const timestamps = Object.keys(recordingMap).sort();
+      if (!timestamps.length) {
+        alert('No data recorded.');
+        return;
+      }
+
+      // Header row: timestamp + player names in current players order
+      const header = ['timestamp', ...players.map(p => p.name)];
+      const csvLines = [];
+      csvLines.push(header.map(escapeCSV).join(','));
+
+      for (const ts of timestamps) {
+        const row = [];
+        row.push(escapeCSV(ts));
+        for (const p of players) {
+          const value = (recordingMap[ts] && recordingMap[ts][p.name] !== undefined) ? recordingMap[ts][p.name] : '';
+          row.push(escapeCSV(value));
+        }
+        csvLines.push(row.join(','));
+      }
+
+      const csvString = csvLines.join('\n');
+      const blob = new Blob([csvString], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const now = new Date();
+      const filename = `hr_record_wide_${now.toISOString().replace(/[:.]/g,'-')}.csv`;
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    // Regenerate players when user clicks button
+    regenerateBtn.addEventListener('click', () => {
+      const count = parseInt(playerCountSelect.value, 10);
+      generatePlayers(count);
+    });
+
+    // initial generate
+    generatePlayers(parseInt(playerCountSelect.value,10));
+
+    // Small safeguard: when window/tab unload, stop any notifications and optionally disconnect
+    window.addEventListener('beforeunload', () => {
+      players.forEach(p => {
+        try {
+          if (p.characteristic) p.characteristic.removeEventListener('characteristicvaluechanged', ()=>{});
+          if (p.device && p.device.gatt && p.device.gatt.connected) p.device.gatt.disconnect();
+        } catch(e) { /* ignore */ }
+      });
+    });
+
+    // End of script
+  </script>
+</body>
+</html>
